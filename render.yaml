@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: mazzi-lab
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
