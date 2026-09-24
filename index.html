@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mazzi Lab</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <div class="brand"><div class="logo">◈</div><div><b>Mazzi Lab</b><small>Archive Analysis Workbench</small></div></div>
+  <div class="safe">● STATIC ANALYSIS · NO EXECUTION</div>
+</header>
+
+<main>
+<section id="landing" class="landing">
+  <div class="hero">◈</div>
+  <h1>Inspect. Understand. Analyze.</h1>
+  <p>ZIP, RAR, 7Z and common compressed archives. Files are extracted for static inspection only and are never executed.</p>
+  <label class="choose">Choose Archive
+    <input id="picker" type="file" accept=".zip,.rar,.7z,.tar,.gz,.bz2,.xz" hidden>
+  </label>
+  <div id="drop" class="drop">or drag an archive here</div>
+  <div class="formats">ZIP · RAR · 7Z · TAR · GZ · BZ2 · XZ</div>
+  <div id="status"></div>
+  <div id="progressWrap" class="progressWrap" hidden>
+    <div class="progress"><div id="progressBar"></div></div>
+    <span id="progressText">0%</span>
+  </div>
+</section>
+
+<section id="workspace" hidden>
+  <aside>
+    <div class="sideTitle">FILES <b id="fileCount">0</b></div>
+    <input id="search" class="search" placeholder="Search files…">
+    <div id="fileList"></div>
+  </aside>
+
+  <section class="content">
+    <div class="toolbar">
+      <span id="crumb" class="crumb">No file selected</span>
+      <button id="newArchive" class="btn">New archive</button>
+      <button id="export" class="btn">Export report</button>
+    </div>
+
+    <div id="stats" class="stats"></div>
+
+    <div class="tabs">
+      <button class="active" data-tab="overview">Overview</button>
+      <button data-tab="code">Code</button>
+      <button data-tab="hex">Hex</button>
+      <button data-tab="strings">Strings</button>
+    </div>
+
+    <div id="overview" class="pane active"></div>
+    <pre id="code" class="pane"></pre>
+    <pre id="hex" class="pane"></pre>
+    <pre id="strings" class="pane"></pre>
+  </section>
+</section>
+</main>
+
+<script>
+const $ = (selector) => document.querySelector(selector);
+
+let session = null;
+let files = [];
+let selected = null;
+let current = null;
+
+function sizeText(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"]/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"
+  }[char]));
+}
+
+function setStatus(message, error = false) {
+  const el = $("#status");
+  el.textContent = message;
+  el.className = error ? "error" : "";
+}
+
+function setProgress(percent, message) {
+  $("#progressWrap").hidden = false;
+  $("#progressBar").style.width = percent + "%";
+  $("#progressText").textContent = message || percent + "%";
+}
+
+function resetProgress() {
+  $("#progressWrap").hidden = true;
+  $("#progressBar").style.width = "0%";
+}
+
+async function parseResponse(response) {
+  const text = await response.text();
+
+  if (!text.trim()) {
+    throw new Error(
+      "The server returned an empty response (HTTP " + response.status + ")."
+    );
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      "The server returned invalid data (HTTP " + response.status + ")."
+    );
+  }
+
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || ("Server error: HTTP " + response.status));
+  }
+
+  return data;
+}
+
+function uploadArchive(file) {
+  if (!file) return;
+
+  setStatus("Uploading " + file.name + " · " + sizeText(file.size));
+  setProgress(0, "0%");
+
+  const xhr = new XMLHttpRequest();
+  const form = new FormData();
+  form.append("file", file);
+
+  xhr.open("POST", "/api/upload");
+  xhr.timeout = 10 * 60 * 1000;
+
+  xhr.upload.onprogress = (event) => {
+    if (event.lengthComputable) {
+      const percent = Math.round((event.loaded / event.total) * 100);
+      setProgress(percent, percent + "% uploaded");
+    } else {
+      setProgress(35, "Uploading…");
+    }
+  };
+
+  xhr.onload = async () => {
+    try {
+      const response = new Response(xhr.responseText, {
+        status: xhr.status,
+        headers: {"Content-Type": xhr.getResponseHeader("Content-Type") || "text/plain"}
+      });
+
+      const data = await parseResponse(response);
+
+      session = data.session;
+      files = data.files || [];
+
+      $("#landing").hidden = true;
+      $("#workspace").hidden = false;
+      $("#fileCount").textContent = files.length;
+
+      setProgress(100, "Complete");
+      setStatus("");
+      renderTree();
+      renderArchive(data);
+    } catch (error) {
+      resetProgress();
+      setStatus("Upload failed: " + error.message, true);
+      console.error(error);
+    }
+  };
+
+  xhr.onerror = () => {
+    resetProgress();
+    setStatus("Network error. Render may have stopped the request.", true);
+  };
+
+  xhr.ontimeout = () => {
+    resetProgress();
+    setStatus("Upload timed out after 10 minutes.", true);
+  };
+
+  xhr.onabort = () => {
+    resetProgress();
+    setStatus("Upload cancelled.", true);
+  };
+
+  xhr.send(form);
+}
+
+function renderTree() {
+  const query = $("#search").value.toLowerCase();
+  const list = $("#fileList");
+  list.innerHTML = "";
+
+  files
+    .filter(file => file.name.toLowerCase().includes(query))
+    .forEach(file => {
+      const row = document.createElement("div");
+      row.className = "file";
+      row.dataset.id = file.id;
+      row.textContent = (file.text ? "◈ " : "▸ ") + file.name;
+      row.onclick = () => selectFile(file.id);
+      list.appendChild(row);
+    });
+}
+
+function renderArchive(data) {
+  $("#stats").innerHTML = `
+    <div><small>ARCHIVE</small><b>${escapeHtml(data.name)}</b></div>
+    <div><small>FILES</small><b>${files.length}</b></div>
+    <div><small>STATUS</small><b class="good">READY</b></div>
+  `;
+
+  $("#overview").innerHTML = `
+    <div class="cards">
+      <div class="card"><small>Archive</small><b>${escapeHtml(data.name)}</b></div>
+      <div class="card"><small>Files</small><b>${files.length}</b></div>
+      <div class="card"><small>Analysis</small><b class="good">STATIC ONLY</b></div>
+    </div>
+    <p class="muted">Select a file to inspect its metadata and contents.</p>
+  `;
+}
+
+async function selectFile(id) {
+  selected = files.find(file => file.id === id);
+  if (!selected) return;
+
+  document.querySelectorAll(".file").forEach(row => {
+    row.classList.toggle("active", Number(row.dataset.id) === id);
+  });
+
+  $("#crumb").textContent = selected.name;
+
+  try {
+    const response = await fetch(`/api/file/${session}/${id}`);
+    const data = await parseResponse(response);
+
+    current = data;
+
+    const bytes = Uint8Array.from(
+      atob(data.data),
+      char => char.charCodeAt(0)
+    );
+
+    const text = new TextDecoder().decode(bytes);
+
+    $("#overview").innerHTML = `
+      <div class="cards">
+        <div class="card"><small>File</small><b>${escapeHtml(data.name)}</b></div>
+        <div class="card"><small>Size</small><b>${sizeText(data.size)}</b></div>
+        <div class="card"><small>SHA-256</small><b>${data.sha256}</b></div>
+        <div class="card"><small>Entropy</small><b>${data.entropy}</b></div>
+        <div class="card">
+          <small>Heuristic indicators</small>
+          <b class="${data.hits.length ? "warn" : "good"}">
+            ${data.hits.length ? escapeHtml(data.hits.join(", ")) : "None detected"}
+          </b>
+        </div>
+      </div>
+      ${data.truncated ? '<p class="warn">Viewer data is limited to the first 10 MB.</p>' : ""}
+    `;
+
+    $("#code").textContent = text || "[empty file]";
+    $("#hex").textContent = makeHex(bytes);
+    $("#strings").textContent = makeStrings(bytes) || "No printable strings found.";
+  } catch (error) {
+    setStatus("Could not read file: " + error.message, true);
+  }
+}
+
+function makeHex(bytes) {
+  let output = "";
+
+  for (let offset = 0; offset < Math.min(bytes.length, 8192); offset += 16) {
+    let hex = "";
+    let ascii = "";
+
+    for (let i = 0; i < 16; i++) {
+      if (offset + i < bytes.length) {
+        const value = bytes[offset + i];
+        hex += value.toString(16).padStart(2, "0") + " ";
+        ascii += value >= 32 && value <= 126
+          ? String.fromCharCode(value)
+          : ".";
+      } else {
+        hex += "   ";
+        ascii += " ";
+      }
+    }
+
+    output += offset.toString(16).padStart(8, "0") +
+      "  " + hex + " |" + ascii + "|\n";
+  }
+
+  return output;
+}
+
+function makeStrings(bytes) {
+  const results = [];
+  let currentString = "";
+
+  for (const value of bytes) {
+    if (value >= 32 && value <= 126) {
+      currentString += String.fromCharCode(value);
+    } else {
+      if (currentString.length >= 4) results.push(currentString);
+      currentString = "";
+    }
+  }
+
+  if (currentString.length >= 4) results.push(currentString);
+
+  return [...new Set(results)].slice(0, 2000).join("\n");
+}
+
+$("#picker").onchange = event => uploadArchive(event.target.files[0]);
+
+$("#drop").ondragover = event => {
+  event.preventDefault();
+  $("#drop").classList.add("drag");
+};
+
+$("#drop").ondragleave = () => $("#drop").classList.remove("drag");
+
+$("#drop").ondrop = event => {
+  event.preventDefault();
+  $("#drop").classList.remove("drag");
+  uploadArchive(event.dataTransfer.files[0]);
+};
+
+$("#search").oninput = renderTree;
+
+document.querySelectorAll(".tabs button").forEach(button => {
+  button.onclick = () => {
+    document.querySelectorAll(".tabs button")
+      .forEach(item => item.classList.remove("active"));
+
+    button.classList.add("active");
+
+    document.querySelectorAll(".pane")
+      .forEach(item => item.classList.remove("active"));
+
+    $("#" + button.dataset.tab).classList.add("active");
+  };
+});
+
+$("#newArchive").onclick = async () => {
+  if (session) {
+    try {
+      await fetch("/api/cleanup/" + session, {method: "POST"});
+    } catch {}
+  }
+
+  location.reload();
+};
+
+$("#export").onclick = () => {
+  if (!current) {
+    alert("Select a file first.");
+    return;
+  }
+
+  const blob = new Blob(
+    [JSON.stringify(current, null, 2)],
+    {type: "application/json"}
+  );
+
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "mazzi-lab-report.json";
+  link.click();
+  URL.revokeObjectURL(link.href);
+};
+</script>
+</body>
+</html>
